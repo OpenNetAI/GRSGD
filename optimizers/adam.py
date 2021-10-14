@@ -114,7 +114,7 @@ class Adam(Optimizer):
 
         return loss
 
-###################################################baseline################################################################
+################################################### Baseline ################################################################
     def step_base(self, closure=None):
         """Performs a single optimization step.
 
@@ -125,9 +125,6 @@ class Adam(Optimizer):
         loss = None
         if closure is not None:
             loss = closure()
-        before=torch.tensor(0.).cuda()
-        num=torch.tensor(0.).cuda()
-        after=torch.tensor(0.).cuda()
 
         for group in self.param_groups:
             for p in group['params']:
@@ -138,15 +135,8 @@ class Adam(Optimizer):
                     raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
                 amsgrad = group['amsgrad']
 
-                local_grad = torch.clone(grad).detach()
-                reno_grad = torch.clone(grad).detach()
-                global_grad = torch.clone(grad).detach()
-                dist.all_reduce(global_grad)  # allreduce通信
-                global_grad /= float(dist.get_world_size())
-                grad = torch.clone(global_grad).detach()
-
-                # dist.all_reduce(grad)
-                # grad /= float(dist.get_world_size())
+                dist.all_reduce(grad)
+                grad /= float(dist.get_world_size())
 
                 state = self.state[p]
 
@@ -187,17 +177,13 @@ class Adam(Optimizer):
                 step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
 
                 p.data.addcdiv_(-step_size, exp_avg, denom)
-                before = before+ torch.norm(local_grad-global_grad)/torch.norm(global_grad)
-                after = after+ torch.norm(reno_grad-global_grad)/torch.norm(global_grad)
-                num = num + 1
-        print(before/num,after/num)
 
         up_percent = 1.0
 
-        return loss,up_percent
+        return loss, up_percent
 
 
-###################################################grsgd################################################################
+################################################### GRSGD ################################################################
     def step_grsgd(self, closure=None):
         """Performs a single optimization step.
 
@@ -211,9 +197,6 @@ class Adam(Optimizer):
 
         up_number = 0
         total_number = 0
-        before=torch.tensor(0.).cuda()
-        num=torch.tensor(0.).cuda()
-        after=torch.tensor(0.).cuda()
 
         for group in self.param_groups:
             for p in group['params']:
@@ -237,20 +220,12 @@ class Adam(Optimizer):
                         # Maintains max of all exp. moving avg. of sq. grad. values
                         state['max_exp_avg_sq'] = torch.zeros_like(p.data)
 
-                local_grad = torch.clone(grad).detach()
-                global_grad = torch.clone(grad).detach()
-                dist.all_reduce(global_grad)  # allreduce通信
-                global_grad /= float(dist.get_world_size())
-                
-
                 if 'g_global_v' not in self.state[p]:
-                    self.state[p]['g_global_v'] = torch.clone(grad).detach()  # 全局第一次通信
+                    self.state[p]['g_global_v'] = torch.clone(grad).detach()
                 g_global_v = self.state[p]['g_global_v']
                 midst = g_global_v.mul(grad)
                 
                 grad_cut = torch.where(midst<=0, grad, g_global_v)  # 异号用新梯度，同号用旧梯度
-
-                reno_grad = torch.clone(grad_cut).detach()
 
                 one_zero = torch.where(midst<=0, torch.tensor(1.).cuda(), torch.tensor(0.).cuda())
                 total_number += grad.numel()
@@ -287,17 +262,13 @@ class Adam(Optimizer):
                 step_size = group['lr'] * math.sqrt(bias_correction2) / bias_correction1
 
                 p.data.addcdiv_(-step_size, exp_avg, denom)
-                before = before+ torch.norm(local_grad-global_grad)/torch.norm(global_grad)
-                after = after+ torch.norm(reno_grad-global_grad)/torch.norm(global_grad)
-                num = num + 1
-        print(before/num,after/num)
 
         up_percent = float(up_number) / float(total_number)
 
         return loss, up_percent
 
 
-###################################################topk################################################################
+################################################### Topk ################################################################
     def step_topk(self, closure=None):
         """Performs a single optimization step.
 
@@ -378,7 +349,7 @@ class Adam(Optimizer):
         return loss, up_percent
 
 
-###################################################mtopk################################################################
+################################################### mTopk ################################################################
     def step_mtopk(self, closure=None):
         """Performs a single optimization step.
 
@@ -427,7 +398,7 @@ class Adam(Optimizer):
                 grad_recover.scatter_(0, indices, values)
                 grad_cut = grad_recover.view(grad.size()).cuda()
 
-                residual = grad - grad_cut  # 残差
+                residual = grad - grad_cut
                 state['residual'] = torch.clone(residual).detach()
 
                 grad = torch.clone(grad_cut).detach()
@@ -466,7 +437,7 @@ class Adam(Optimizer):
         return loss, up_percent
 
 
-###################################################dgc################################################################
+################################################### DGC ###############################################################
     def step_dgc(self, closure=None):
         """Performs a single optimization step.
 
@@ -566,7 +537,7 @@ class Adam(Optimizer):
         return loss, up_percent
 
 
-###################################################tcs################################################################
+################################################### TCS ################################################################
     def step_tcs(self, closure=None):
         """Performs a single optimization step.
 

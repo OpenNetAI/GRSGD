@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import optimizers
 import torch.multiprocessing as mp
 import torch.distributed as dist
 from torch.optim.lr_scheduler import MultiStepLR
@@ -12,8 +12,6 @@ from tensorboardX import SummaryWriter
 import os
 import argparse
 import sys
-import time
-from functools import partial
 
 import models
 from utils import *
@@ -36,7 +34,7 @@ def train(epoch, net, dataloader, criterion, optimizer, rank, args, writer):
 
     OPTIMS = {
         'baseline': optimizer.step_base,
-        's3sgd': optimizer.step_s3sgd,
+        'grsgd': optimizer.step_grsgd,
         'topk': optimizer.step_topk,
         'mtopk': optimizer.step_mtopk,
         'dgc': optimizer.step_dgc,
@@ -67,7 +65,7 @@ def train(epoch, net, dataloader, criterion, optimizer, rank, args, writer):
         writer.add_scalar(f'train_loss', train_loss / (batch_idx + 1), step)
         writer.add_scalar(f'train_acc', correct / total, step)
         writer.add_scalar(f'Up_percent', up_percent, step)
-        print(f'Step [{epoch}-{step}] Training* loss:{train_loss / (batch_idx + 1)} | acc: {correct / total} | up_percent: {up_percent} | time: {time.time()}')
+        print(f'Step [{epoch}-{step}] Training* loss:{train_loss / (batch_idx + 1)} | acc: {correct / total} | up_percent: {up_percent}')
 
     return train_loss / loader_len, correct / total, correct, total
 
@@ -88,7 +86,7 @@ def test(epoch, net, dataloader, criterion, rank, writer, trainloader_len):
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
-            print(f'Testing* loss:{test_loss / (batch_idx + 1)} | acc: {correct / total} | time: {time.time()}')
+            print(f'Testing* loss:{test_loss / (batch_idx + 1)} | acc: {correct / total}')
         step = trainloader_len * epoch
         writer.add_scalar(f'test_loss', test_loss / (batch_idx + 1), step)
         writer.add_scalar(f'test_acc', correct / total, step)
@@ -110,15 +108,15 @@ def main_worker(rank, args, gpus):
 
     # Data
     print('==> Preparing data..')
-    # =======================================数据集mnist=========================================================== #
+    # =======================================Dataset MNIST=========================================================== #
     if args.dataset == 'mnist':
         trans_mnist = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
-        dataset_train = torchvision.datasets.MNIST('./data/mnist/', train=True, download=True, transform=trans_mnist)
+        dataset_train = torchvision.datasets.MNIST(args.data_dir, train=True, download=True, transform=trans_mnist)
         sampler = torch.utils.data.DistributedSampler(dataset_train)
         trainloader = torch.utils.data.DataLoader(dataset_train,num_workers=4,batch_size=args.batch_size,shuffle=(sampler is None),sampler=sampler)
-        dataset_test = torchvision.datasets.MNIST('./data/mnist/', train=False, download=True, transform=trans_mnist)
+        dataset_test = torchvision.datasets.MNIST(args.data_dir, train=False, download=True, transform=trans_mnist)
         testloader = torch.utils.data.DataLoader(dataset_test,num_workers=2,batch_size=args.batch_size,shuffle=False)
-    # =======================================数据集cifar10=========================================================== #
+    # =======================================Dataset Cifar10=========================================================== #
     elif args.dataset == 'cifar':
         transform_train = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
@@ -130,43 +128,16 @@ def main_worker(rank, args, gpus):
             transforms.ToTensor(),
             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
         ])
-        dataset_train = torchvision.datasets.CIFAR10('../s3sgd_simu/data/cifar/', train=True, download=True, transform=transform_train)
+        dataset_train = torchvision.datasets.CIFAR10(args.data_dir, train=True, download=True, transform=transform_train)
         sampler = torch.utils.data.DistributedSampler(dataset_train, num_replicas=args.world_size, rank=rank)
         trainloader = torch.utils.data.DataLoader(dataset_train, batch_size=args.batch_size, shuffle=False,
                                                   num_workers=0, sampler=sampler)
-        dataset_test = torchvision.datasets.CIFAR10('../s3sgd_simu/data/cifar/', train=False, download=True, transform=transform_test)
+        dataset_test = torchvision.datasets.CIFAR10(args.data_dir, train=False, download=True, transform=transform_test)
         testloader = torch.utils.data.DataLoader(dataset_test, batch_size=100, shuffle=False, num_workers=0)
-    # =======================================数据集imagenet=========================================================== #
-    elif args.dataset == 'imagenet':
-        dataset_train = torchvision.datasets.ImageFolder(
-            '/data/public/datasets/ImageNet/train',
-            # 对数据进行预处理
-            transforms.Compose([                      # 将几个transforms 组合在一起
-                transforms.RandomSizedCrop(224),      # 随机切再resize成给定的size大小
-                transforms.RandomHorizontalFlip(),    # 概率为0.5，随机水平翻转。
-                transforms.ToTensor(),                # 把一个取值范围是[0,255]或者shape为(H,W,C)的numpy.ndarray，
-                                                      # 转换成形状为[C,H,W]，取值范围是[0,1.0]的torch.FloadTensor
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225]),
-            ]))
-        dataset_test = torchvision.datasets.ImageFolder('/data/public/datasets/ImageNet/val', transforms.Compose([
-            # 重新改变大小为`size`，若：height>width`,则：(size*height/width, size)
-            transforms.Scale(256),
-            # 将给定的数据进行中心切割，得到给定的size。
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225]),
-        ]))
-        sampler = torch.utils.data.DistributedSampler(dataset_train, num_replicas=args.world_size, rank=rank)
-        trainloader = torch.utils.data.DataLoader(dataset_train, batch_size=args.batch_size, shuffle=False,
-                                                  num_workers=0, sampler=sampler)
-        testloader = torch.utils.data.DataLoader(dataset_test, batch_size=100, shuffle=False, num_workers=0)
-        # exit(0)
     else:
         exit('Error: unrecognized dataset')
 
-    # # copy weights and others to other model
+    # copy weights and others to other model
     print('==> Building model..')
     net = MODELS[args.model]().cuda()
     for p in net.parameters():
@@ -184,20 +155,20 @@ def main_worker(rank, args, gpus):
         print(f'==> Starting from {start_epoch}...')
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
-    sched = MultiStepLR(optimizer, [100, 200], gamma=0.1)
+    optimizer = optimizers.SGD(net.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+    sched = MultiStepLR(optimizer, [40, 70], gamma=0.1)
 
     writer = SummaryWriter(os.path.join(args.log_dir, f'rank_{rank:02}'), purge_step=start_epoch * len(trainloader))
     trainloader_len = len(trainloader)
 
     for epoch in range(start_epoch, args.epochs):
         loss, acc, correct, total = train(epoch, net, trainloader, criterion, optimizer, rank, args, writer)
-        print('Rank: %d | Loss: %.3f | Acc: %.3f%% (%d/%d) | Time: %f' %
-              (rank, loss, acc, correct, total, time.time()))
+        print('Rank: %d | Loss: %.3f | Acc: %.3f%% (%d/%d)' %
+              (rank, loss, acc, correct, total))
         if rank == 0 or args.test_all:
             loss, acc, correct, total = test(epoch, net, testloader, criterion, rank, writer, trainloader_len)
-            print('Rank: %d | Loss: %.3f | Acc: %.3f%% (%d/%d) | Time: %f' %
-                  (rank, loss, acc, correct, total, time.time()))
+            print('Rank: %d | Loss: %.3f | Acc: %.3f%% (%d/%d)' %
+                  (rank, loss, acc, correct, total))
         sched.step(epoch)
 
         print('==>Saving...')
@@ -215,12 +186,12 @@ def main_worker(rank, args, gpus):
 
     if rank == 0 or args.test_all:
         loss, acc, correct, total = test(args.epochs, net, testloader, criterion, rank, writer, trainloader_len)
-        print('Rank: %d | Loss: %.3f | Acc: %.3f%% (%d/%d) | Time: %f' %
-              (rank, loss, acc, correct, total, time.time()))
+        print('Rank: %d | Loss: %.3f | Acc: %.3f%% (%d/%d)' %
+              (rank, loss, acc, correct, total))
 
 
 def main():
-    parser = argparse.ArgumentParser(description='s3sgd Simulation for CV')
+    parser = argparse.ArgumentParser(description='GRSGD Simulation for MNIST and Cifar10')
     parser.add_argument('--model', default='CNNmnist', help='model name')
     parser.add_argument('--dataset', default='mnist', help='dataset name')
     parser.add_argument('--master-addr', default='127.0.0.1', help='master addr')

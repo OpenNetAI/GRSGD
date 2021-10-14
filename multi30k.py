@@ -1,28 +1,19 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
+import optimizers
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.utils.data import DataLoader, DistributedSampler
-
 from torchtext.datasets import Multi30k
 from torchtext.data import Field, BucketIterator, Batch
-
-import pandas as pd
-import matplotlib.pyplot as plt
-import statsmodels.api as sm
-import numpy as np
 from mpl_toolkits.axisartist.axislines import SubplotZero
-
-import spacy
 from tensorboardX import SummaryWriter
 
+import spacy
 import math
 import argparse
 import os
-import time
 import sys
-from functools import partial
 
 from models.seq2seq import *
 from utils import *
@@ -44,15 +35,13 @@ def train(epoch, model, iterator, optimizer, criterion, clip, rank, args, writer
     model.train()
     epoch_loss = 0
     loader_len = len(iterator)
-    arr_diver=np.array([])
     OPTIMS = {
         'baseline': optimizer.step_base,
-        's3sgd': optimizer.step_s3sgd,
+        'grsgd': optimizer.step_grsgd,
         'topk': optimizer.step_topk,
         'mtopk': optimizer.step_mtopk,
         'tcs': optimizer.step_tcs,
         'dgc': optimizer.step_dgc,
-        'similar':optimizer.step_similar
     }
 
     for i, batch in enumerate(iterator):
@@ -102,7 +91,7 @@ def evaluate(epoch, model, iterator, criterion, rank, writer, trainloader):
 
             step = epoch * loader_len + i
             if step%10 == 0:
-                print(f'Testing* loss:{epoch_loss/(i+1)} | ppl: {math.exp(epoch_loss/(i+1))} | time: {time.time()}')
+                print(f'Testing* loss:{epoch_loss/(i+1)} | ppl: {math.exp(epoch_loss/(i+1))}')
         iteration = len(trainloader)*(epoch+1)
         writer.add_scalar(f'eval_loss', epoch_loss/loader_len, iteration)
         writer.add_scalar(f'eval_ppl', math.exp(epoch_loss/loader_len), iteration)
@@ -128,7 +117,6 @@ def main_work(rank, args, gpus):
     start_epoch = 0
     print(args)
 
-    # seed = 1234
     enc_emb_dim = args.enc_emb
     dec_emb_dim = args.dec_emb
     enc_hid_dim = args.enc_hid
@@ -153,7 +141,7 @@ def main_work(rank, args, gpus):
                    eos_token='<eos>',
                    lower=True)
 
-    train_data, valid_data, test_data = Multi30k.splits(root='/data/users/nwy/code/s3sgd_simu_2/data/',
+    train_data, valid_data, test_data = Multi30k.splits(root=args.data_dir,
                                                         exts=('.de', '.en'),
                                                         fields=(source, target))
 
@@ -199,9 +187,7 @@ def main_work(rank, args, gpus):
     test_loader = DataLoader(test_data, batch_size=batch_size, collate_fn=torchtext_collate,
                              shuffle=False, num_workers=0, pin_memory=True)
 
-    # print(f'The model has {count_parameters(model):,} trainable parameters')
-
-    optimizer = optim.Adam(model.parameters())
+    optimizer = optimizers.Adam(model.parameters())
 
     PAD_IDX = target.vocab.stoi['<pad>']
 
@@ -213,11 +199,11 @@ def main_work(rank, args, gpus):
         print(f'==>Epoch: {epoch}')
         train_loss = train(epoch, model, train_loader, optimizer, criterion, clip, rank, args, writer)
         print(f'\t Rank: {rank} | Train Loss: {train_loss:.3f} | '
-              f'Train PPL: {math.exp(train_loss):7.3f} | Time: {time.time()}')
+              f'Train PPL: {math.exp(train_loss):7.3f}')
         if args.test_all or rank == 0:
             valid_loss = evaluate(epoch, model, valid_loader, criterion, rank, writer, train_loader)
             print(f'\t Rank: {rank} | Val. Loss: {valid_loss:.3f} |  '
-                  f'Val. PPL: {math.exp(valid_loss):7.3f} | Time: {time.time()}')
+                  f'Val. PPL: {math.exp(valid_loss):7.3f}')
 
         print('==>Saving...')
         state = {
@@ -234,11 +220,11 @@ def main_work(rank, args, gpus):
 
     if args.test_all or rank == 0:
         test_loss = evaluate(n_epochs, model, test_loader, criterion, rank, writer)
-        print(f'| Test Loss: {test_loss:.3f} | Test PPL: {math.exp(test_loss):7.3f} | Time: {time.time()}')
+        print(f'| Test Loss: {test_loss:.3f} | Test PPL: {math.exp(test_loss):7.3f}')
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Muti-Ring Simulation for NLP')
+    parser = argparse.ArgumentParser(description='GRSGD Simulation for Multi30k')
     parser.add_argument('--world-size', default=4, type=int,
                         help='node size in simulation')
     parser.add_argument('--master-addr', default='127.0.0.1', help='master addr')

@@ -4,12 +4,12 @@ import shutil
 import time
 import sys
 
+import optimizers
 import torch
 import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
-import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
 import torch.multiprocessing as mp
@@ -23,9 +23,9 @@ def main():
         if name.islower() and not name.startswith("__")
         and callable(models.__dict__[name]))
 
-    parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-    parser.add_argument('data', metavar='DIR',
-                        help='path to dataset')
+    parser = argparse.ArgumentParser(description='GRSGD Simulation for ImageNet')
+    parser.add_argument('--data-dir', default='./data',
+                        help='the data directory location')
     parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet18',
                         choices=model_names,
                         help='model architecture: ' +
@@ -41,7 +41,7 @@ def main():
                         help='manual epoch number (useful on restarts)')
     parser.add_argument('-b', '--batch-size', default=256, type=int,
                         metavar='N', help='mini-batch size (default: 256)')
-    parser.add_argument('--lr', '--learning-rate', default=0.1, type=float,
+    parser.add_argument('--lr', '--learning-rate', default=0.3, type=float,
                         metavar='LR', help='initial learning rate')
     parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
                         help='momentum')
@@ -61,8 +61,6 @@ def main():
                         help='url used to set up distributed training')
     parser.add_argument('--dist-backend', default='gloo', type=str,
                         help='distributed backend')
-    # parser.add_argument('--dist-rank', default=0, type=int,
-    #                     help='rank of distributed processes')
     parser.add_argument('--gpus', required=True, help='gpu id the code runs on')
     parser.add_argument('--checkpoint', default='./checkpoint/CNNmnist', help='checkpoint location')
     parser.add_argument('--stdout', default='./stdout/CNNmnist')
@@ -107,9 +105,7 @@ def main_worker(rank, args, gpus, best_prec1):
         print("=> creating model '{}'".format(args.arch))
 
         model = models.__dict__[args.arch]()
-
         model.cuda()
-        # model = torch.nn.parallel.DistributedDataParallel(model,device_ids=[gpu], output_device=gpu)
 
     for p in model.parameters():
         if p.requires_grad:
@@ -119,7 +115,7 @@ def main_worker(rank, args, gpus, best_prec1):
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda()
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+    optimizer = optimizers.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
@@ -136,8 +132,8 @@ def main_worker(rank, args, gpus, best_prec1):
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
+    traindir = os.path.join(args.data_dir, 'train')
+    valdir = os.path.join(args.data_dir, 'val')
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
 
@@ -225,15 +221,15 @@ def train(writer, args, train_loader, model, criterion, optimizer, epoch):
 
     OPTIMS = {
         'baseline': optimizer.step_base,
-        's3sgd': optimizer.step_s3sgd,
-        'topk': optimizer.step_topk
+        'grsgd': optimizer.step_grsgd,
+        'topk': optimizer.step_topk,
+        'mtopk': optimizer.step_mtopk,
+        'dgc': optimizer.step_dgc,
+        'tcs': optimizer.step_tcs
     }
 
     end = time.time()
     for i, (input, target) in enumerate(train_loader):
-        # measure data loading time
-        data_time.update(time.time() - end)
-
         input = input.cuda()
         target = target.cuda()
 
@@ -254,22 +250,15 @@ def train(writer, args, train_loader, model, criterion, optimizer, epoch):
         # optimizer.step()
         _, up_percent = OPTIMS[args.optim]()
 
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-
         step = len(train_loader) * epoch + i
 
         if i % args.print_freq == 0:
             print('Epoch: [{0}][{1}/{2}]\t'
-                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
                   'Prec@1 {top1.val:.3f} ({top1.avg:.3f})\t'
                   'Prec@5 {top5.val:.3f} ({top5.avg:.3f})\t'
                   'Up_percent {up_percent:.3f}'.format(
-                   epoch, i, len(train_loader), batch_time=batch_time,
-                   data_time=data_time, loss=losses, top1=top1, top5=top5, up_percent=up_percent))
+                   epoch, i, len(train_loader), loss=losses, top1=top1, top5=top5, up_percent=up_percent))
             writer.add_scalar(f'train_loss', losses.val, step)
             writer.add_scalar(f'train_acc', top1.val, step)
             writer.add_scalar(f'Up_percent', up_percent, step)
