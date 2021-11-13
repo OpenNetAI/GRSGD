@@ -114,13 +114,10 @@ class Adam(Optimizer):
 
         return loss
 
-################################################### Baseline ################################################################
+###================================================= Baseline =====================================================###
     def step_base(self, closure=None):
-        """Performs a single optimization step.
-
-        Arguments:
-            closure (callable, optional): A closure that reevaluates the model
-                and returns the loss.
+        """
+        A single optimization step without sparsification.
         """
         loss = None
         if closure is not None:
@@ -135,6 +132,7 @@ class Adam(Optimizer):
                     raise RuntimeError('Adam does not support sparse gradients, please consider SparseAdam instead')
                 amsgrad = group['amsgrad']
 
+                # average the gradients of all workers
                 dist.all_reduce(grad)
                 grad /= float(dist.get_world_size())
 
@@ -178,18 +176,15 @@ class Adam(Optimizer):
 
                 p.data.addcdiv_(-step_size, exp_avg, denom)
 
-        up_percent = 1.0
+        up_ratio = 1.0
 
-        return loss, up_percent
+        return loss, up_ratio
 
 
-################################################### GRSGD ################################################################
+###================================================== GRSGD =======================================================###
     def step_grsgd(self, closure=None):
-        """Performs a single optimization step.
-
-        Arguments:
-            closure (callable, optional): A closure that reevaluates the model
-                and returns the loss.
+        """
+        A single optimization step using Global Renovating SGD.
         """
         loss = None
         if closure is not None:
@@ -219,21 +214,24 @@ class Adam(Optimizer):
                     if amsgrad:
                         # Maintains max of all exp. moving avg. of sq. grad. values
                         state['max_exp_avg_sq'] = torch.zeros_like(p.data)
-
+                # get the previous-round gradient
                 if 'g_global_v' not in self.state[p]:
                     self.state[p]['g_global_v'] = torch.clone(grad).detach()
                 g_global_v = self.state[p]['g_global_v']
                 midst = g_global_v.mul(grad)
-                
-                grad_cut = torch.where(midst<=0, grad, g_global_v)  # 异号用新梯度，同号用旧梯度
+                # renovate the sparsified same-sign part with the previous-round gradient
+                grad_cut = torch.where(midst<=0, grad, g_global_v)
 
+                # calculate the upload ratio
                 one_zero = torch.where(midst<=0, torch.tensor(1.).cuda(), torch.tensor(0.).cuda())
                 total_number += grad.numel()
                 up_number += one_zero.sum().item()
 
-                dist.all_reduce(grad_cut)  # allreduce通信
+                # average the gradients of all workers
+                dist.all_reduce(grad_cut)
                 grad_cut /= float(dist.get_world_size())
-                self.state[p]['g_global_v'] = torch.clone(grad_cut).detach()  # 更新上一轮全局梯度
+                # update the previous-round gradient
+                self.state[p]['g_global_v'] = torch.clone(grad_cut).detach()
                 grad = p.grad.data = torch.clone(grad_cut).detach()
 
                 exp_avg, exp_avg_sq = state['exp_avg'], state['exp_avg_sq']
@@ -263,18 +261,15 @@ class Adam(Optimizer):
 
                 p.data.addcdiv_(-step_size, exp_avg, denom)
 
-        up_percent = float(up_number) / float(total_number)
+        up_ratio = float(up_number) / float(total_number)
 
-        return loss, up_percent
+        return loss, up_ratio
 
 
-################################################### Topk ################################################################
+###================================================== Topk ========================================================###
     def step_topk(self, closure=None):
-        """Performs a single optimization step.
-
-        Arguments:
-            closure (callable, optional): A closure that reevaluates the model
-                and returns the loss.
+        """
+        A single optimization step using Top-k.
         """
         loss = None
         if closure is not None:
@@ -304,15 +299,17 @@ class Adam(Optimizer):
                         # Maintains max of all exp. moving avg. of sq. grad. values
                         state['max_exp_avg_sq'] = torch.zeros_like(p.data)
 
+                # get the top-k values and indices
                 k = max(1, int(grad.numel() * upload_ratio))
                 grad_line = grad.flatten().cuda()
                 _, indices = torch.topk(grad_line.abs(), k)
                 values = grad_line[indices].cuda()
+                # Recover the sparsified gradient
                 grad_recover = torch.zeros(grad_line.numel(), dtype=values.dtype, layout=values.layout,
                                           device=values.device)
                 grad_recover.scatter_(0, indices, values)
                 grad_cut = grad_recover.view(grad.size()).cuda()
-
+                # average the gradients of all workers
                 grad = torch.clone(grad_cut).detach()
                 dist.all_reduce(grad)
                 grad /= float(dist.get_world_size())
@@ -344,12 +341,12 @@ class Adam(Optimizer):
 
                 p.data.addcdiv_(-step_size, exp_avg, denom)
 
-        up_percent = upload_ratio
+        up_ratio = upload_ratio
 
-        return loss, up_percent
+        return loss, up_ratio
 
 
-################################################### mTopk ################################################################
+###================================================== mTopk =======================================================###
     def step_mtopk(self, closure=None):
         """Performs a single optimization step.
 
@@ -385,22 +382,24 @@ class Adam(Optimizer):
                         # Maintains max of all exp. moving avg. of sq. grad. values
                         state['max_exp_avg_sq'] = torch.zeros_like(p.data)
                 
+                # get the residual and compensate
                 if 'residual' not in state:
                     state['residual'] = torch.zeros_like(grad).detach()
                 grad = grad + state['residual']
-
+                # get the top-k values and indices
                 k = max(1, int(grad.numel() * upload_ratio))
                 grad_line = grad.flatten().cuda()
                 _, indices = torch.topk(grad_line.abs(), k)
                 values = grad_line[indices].cuda()
+                # Recover the sparsified gradient
                 grad_recover = torch.zeros(grad_line.numel(), dtype=values.dtype, layout=values.layout,
                                           device=values.device)
                 grad_recover.scatter_(0, indices, values)
                 grad_cut = grad_recover.view(grad.size()).cuda()
-
+                # update the residual
                 residual = grad - grad_cut
                 state['residual'] = torch.clone(residual).detach()
-
+                # average the gradients of all workers
                 grad = torch.clone(grad_cut).detach()
                 dist.all_reduce(grad)
                 grad /= float(dist.get_world_size())
@@ -432,12 +431,12 @@ class Adam(Optimizer):
 
                 p.data.addcdiv_(-step_size, exp_avg, denom)
 
-        up_percent = upload_ratio
+        up_ratio = upload_ratio
 
-        return loss, up_percent
+        return loss, up_ratio
 
 
-################################################### DGC ###############################################################
+###=================================================== DGC ========================================================###
     def step_dgc(self, closure=None):
         """Performs a single optimization step.
 
@@ -475,17 +474,14 @@ class Adam(Optimizer):
                 
                 if 'residual' not in state:
                     state['residual'] = torch.zeros_like(grad).detach()
-                
-                # 先补偿
-                # 第一步：梯度裁剪
+                # local gradient clipping
                 tensor_squ_sum = torch.sum(grad * grad).cuda()
                 dist.all_reduce(tensor_squ_sum)
                 clipping_val = torch.sqrt(tensor_squ_sum / dist.get_world_size())
                 grad = grad.clamp(-clipping_val, clipping_val)
-                # 第二步：残差补偿
+                # compensate
                 grad = grad + state['residual']
-
-                # 再压缩
+                # top-k sparsification with 1% sampling
                 grad_line = grad.flatten()
                 sample_shape = [max(1, int(grad_line.numel() * 0.01))]
                 sample_index = torch.empty(sample_shape).uniform_(0, grad_line.numel()).type(torch.long).cuda()
@@ -493,15 +489,15 @@ class Adam(Optimizer):
                 k = max(1, int(grad.numel() * upload_ratio * 0.01))
                 sample_abs = sample_tensor.abs()
                 grad_abs = grad.abs()
-
                 values, indices = torch.topk(sample_abs, k)
                 threshold = values.min()
                 grad_cut = torch.where(grad_abs >= threshold, grad, torch.tensor(0.).cuda())
 
-                residual = grad - grad_cut  # 残差
+                # update the residual
+                residual = grad - grad_cut
                 state['residual'] = torch.clone(residual).detach()
-
-                dist.all_reduce(grad_cut)  # allreduce通信
+                # average the gradients of all workers
+                dist.all_reduce(grad_cut)
                 grad_cut /= float(dist.get_world_size())
                 grad = torch.clone(grad_cut).detach()
 
@@ -532,12 +528,12 @@ class Adam(Optimizer):
 
                 p.data.addcdiv_(-step_size, exp_avg, denom)
 
-        up_percent = upload_ratio
+        up_ratio = upload_ratio
 
-        return loss, up_percent
+        return loss, up_ratio
 
 
-################################################### TCS ################################################################
+###=================================================== TCS ========================================================###
     def step_tcs(self, closure=None):
         """Performs a single optimization step.
 
@@ -575,31 +571,34 @@ class Adam(Optimizer):
                         state['max_exp_avg_sq'] = torch.zeros_like(p.data)
                 
                 commu_term = grad
+                # get the residual and compensate
                 if 'residual' not in state:
                     state['residual'] = torch.zeros_like(grad).detach()
                     state['global_indices'] = torch.tensor([i for i in range(grad.flatten().numel())]).cuda()
                 commu_term = commu_term + state['residual']
-
+                # retain the values corresponding to the global top-k indices
                 commu_term_line = commu_term.flatten()
                 global_indices = state['global_indices']
                 l_global_values = commu_term_line[global_indices].cuda()
                 commu_term_recover = torch.zeros(commu_term_line.numel(), dtype=l_global_values.dtype, layout=l_global_values.layout,
                                           device=l_global_values.device)
                 commu_term_recover.scatter_(0, global_indices, l_global_values)
-
+                # retain the values corresponding to the local top-k indices
                 local_term_line = commu_term_line - commu_term_recover
                 local_k = max(1, int(local_term_line.numel() * local_ratio))
                 _, local_indices = torch.topk(local_term_line.abs(), local_k)
                 local_values = local_term_line[local_indices].cuda()
                 commu_term_recover.scatter_(0, local_indices, local_values)
-
                 commu_term_cut = commu_term_recover.view(commu_term.size()).cuda()
-                state['residual'] = torch.clone(commu_term-commu_term_cut).detach()
 
-                dist.all_reduce(commu_term_cut)     # allreduce通信
+                # update the residual
+                state['residual'] = torch.clone(commu_term-commu_term_cut).detach()
+                # average the gradients of all workers
+                dist.all_reduce(commu_term_cut)
                 commu_term_cut /= float(dist.get_world_size())
                 grad = torch.clone(commu_term_cut).detach()
 
+                # update the global top-k indices
                 global_term = torch.clone(commu_term_cut).detach()
                 global_k = max(1, int(global_term.numel() * global_ratio))
                 global_term_line = global_term.flatten().cuda()
@@ -633,7 +632,7 @@ class Adam(Optimizer):
 
                 p.data.addcdiv_(-step_size, exp_avg, denom)
 
-        up_percent = global_ratio+local_ratio
+        up_ratio = global_ratio+local_ratio
 
-        return loss, up_percent
+        return loss, up_ratio
 
